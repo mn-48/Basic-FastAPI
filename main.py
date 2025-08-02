@@ -6,19 +6,19 @@ from datetime import datetime, timedelta
 from typing import Optional
 from pydantic import BaseModel
 import asyncpg
-from typing import Optional
+import uuid
 
 # FastAPI অ্যাপ তৈরি
 app = FastAPI()
 
 # PostgreSQL কনফিগারেশন
-# DATABASE_URL = "postgresql://user:password@localhost:5432/authdb"
 DATABASE_URL = "postgresql://nazmul:123456@localhost:5432/authdb"
 
 # সিক্রেট কী এবং অ্যালগরিদম
 SECRET_KEY = "your-secret-key"  # প্রোডাকশনে এটি সিকিউর কী ব্যবহার করুন
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 7
 
 # পাসওয়ার্ড হ্যাশিং
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -34,6 +34,12 @@ class User(BaseModel):
 
 class UserInDB(User):
     hashed_password: str
+
+# টোকেন মডেল
+class Token(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str
 
 # ডাটাবেস কানেকশন পুল তৈরি
 async def get_db():
@@ -78,7 +84,7 @@ async def authenticate_user(conn, username: str, password: str):
         return False
     return user
 
-# JWT টোকেন তৈরি
+# JWT অ্যাক্সেস টোকেন তৈরি
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     if expires_delta:
@@ -88,6 +94,42 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
+# JWT রিফ্রেশ টোকেন তৈরি
+def create_refresh_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# রিফ্রেশ টোকেন সংরক্ষণ
+async def store_refresh_token(conn, user_id: str, refresh_token: str):
+    token_id = str(uuid.uuid4())
+    expires_at = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    query = """
+    INSERT INTO refresh_tokens (token_id, user_id, refresh_token, expires_at)
+    VALUES ($1, $2, $3, $4)
+    """
+    await conn.execute(query, token_id, user_id, refresh_token, expires_at)
+
+# রিফ্রেশ টোকেন ভেরিফাই
+async def verify_refresh_token(conn, refresh_token: str):
+    try:
+        payload = jwt.decode(refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            return None
+        query = "SELECT user_id FROM refresh_tokens WHERE refresh_token = $1 AND expires_at > $2"
+        result = await conn.fetchrow(query, refresh_token, datetime.utcnow())
+        if result is None:
+            return None
+        return username
+    except JWTError:
+        return None
 
 # বর্তমান ইউজার পাওয়া
 async def get_current_user(token: str = Depends(oauth2_scheme), conn = Depends(get_db)):
@@ -120,6 +162,15 @@ async def init_db():
                 disabled BOOLEAN NOT NULL
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS refresh_tokens (
+                token_id VARCHAR(36) PRIMARY KEY,
+                user_id VARCHAR(50) NOT NULL,
+                refresh_token TEXT NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users (username)
+            )
+        """)
     finally:
         await conn.close()
 
@@ -129,7 +180,7 @@ async def startup_event():
     await init_db()
 
 # টোকেন জেনারেট করার এন্ডপয়েন্ট
-@app.post("/token")
+@app.post("/token", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), conn = Depends(get_db)):
     user = await authenticate_user(conn, form_data.username, form_data.password)
     if not user:
@@ -139,10 +190,35 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
             headers={"WWW-Authenticate": "Bearer"},
         )
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    refresh_token_expires = timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
     access_token = create_access_token(
         data={"sub": user.username}, expires_delta=access_token_expires
     )
-    return {"access_token": access_token, "token_type": "bearer"}
+    refresh_token = create_refresh_token(
+        data={"sub": user.username}, expires_delta=refresh_token_expires
+    )
+    await store_refresh_token(conn, user.username, refresh_token)
+    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
+
+# রিফ্রেশ টোকেন এন্ডপয়েন্ট
+@app.post("/refresh", response_model=Token)
+async def refresh_access_token(refresh_token: str, conn = Depends(get_db)):
+    username = await verify_refresh_token(conn, refresh_token)
+    if username is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    new_access_token = create_access_token(
+        data={"sub": username}, expires_delta=access_token_expires
+    )
+    new_refresh_token = create_refresh_token(
+        data={"sub": username}, expires_delta=timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+    await store_refresh_token(conn, username, new_refresh_token)
+    return {"access_token": new_access_token, "refresh_token": new_refresh_token, "token_type": "bearer"}
 
 # ইউজার তৈরির এন্ডপয়েন্ট
 @app.post("/users/")

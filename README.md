@@ -17,3 +17,10 @@ uvicorn main:app --reload
 pip install fastapi uvicorn python-jose[cryptography] passlib[bcrypt] python-multipart
 
 ```
+
+
+# db
+```
+DATABASE_URL = "postgresql://user:password@localhost:5432/authdb"
+
+```
