@@ -41,6 +41,16 @@ class Token(BaseModel):
     refresh_token: str
     token_type: str
 
+# টোকেন ভেরিফিকেশন মডেল
+class TokenVerifyRequest(BaseModel):
+    token: str
+    token_type: str  # "access" বা "refresh"
+
+class TokenVerifyResponse(BaseModel):
+    valid: bool
+    message: str
+    username: Optional[str] = None
+
 # ডাটাবেস কানেকশন পুল তৈরি
 async def get_db():
     conn = await asyncpg.connect(DATABASE_URL)
@@ -131,6 +141,44 @@ async def verify_refresh_token(conn, refresh_token: str):
     except JWTError:
         return None
 
+# টোকেন ভেরিফাই ফাংশন
+async def verify_token(token: str, token_type: str, conn):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            return TokenVerifyResponse(valid=False, message="Invalid token: No username in payload")
+        
+        if token_type == "access":
+            user = await get_user(conn, username)
+            if user is None or user.disabled:
+                return TokenVerifyResponse(valid=False, message="Invalid token: User not found or disabled")
+            return TokenVerifyResponse(valid=True, message="Access token is valid", username=username)
+        
+        elif token_type == "refresh":
+            username_from_db = await verify_refresh_token(conn, token)
+            if username_from_db is None:
+                return TokenVerifyResponse(valid=False, message="Invalid or expired refresh token")
+            return TokenVerifyResponse(valid=True, message="Refresh token is valid", username=username_from_db)
+        
+        else:
+            return TokenVerifyResponse(valid=False, message="Invalid token type specified")
+    except JWTError:
+        return TokenVerifyResponse(valid=False, message="Invalid token: Failed to decode")
+
+# রিফ্রেশ টোকেন রিভোক
+async def revoke_refresh_token(conn, refresh_token: str, username: str):
+    query = """
+    DELETE FROM refresh_tokens 
+    WHERE refresh_token = $1 AND user_id = $2
+    """
+    result = await conn.execute(query, refresh_token, username)
+    if result == "DELETE 0":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Refresh token not found or already revoked"
+        )
+
 # বর্তমান ইউজার পাওয়া
 async def get_current_user(token: str = Depends(oauth2_scheme), conn = Depends(get_db)):
     credentials_exception = HTTPException(
@@ -219,6 +267,17 @@ async def refresh_access_token(refresh_token: str, conn = Depends(get_db)):
     )
     await store_refresh_token(conn, username, new_refresh_token)
     return {"access_token": new_access_token, "refresh_token": new_refresh_token, "token_type": "bearer"}
+
+# রিফ্রেশ টোকেন রিভোক এন্ডপয়েন্ট
+@app.post("/revoke")
+async def revoke_token(refresh_token: str, current_user: User = Depends(get_current_user), conn = Depends(get_db)):
+    await revoke_refresh_token(conn, refresh_token, current_user.username)
+    return {"message": "Refresh token revoked successfully"}
+
+# টোকেন ভেরিফাই এন্ডপয়েন্ট
+@app.post("/verify", response_model=TokenVerifyResponse)
+async def verify_token_endpoint(request: TokenVerifyRequest, conn = Depends(get_db)):
+    return await verify_token(request.token, request.token_type, conn)
 
 # ইউজার তৈরির এন্ডপয়েন্ট
 @app.post("/users/")
