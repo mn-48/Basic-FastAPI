@@ -7,6 +7,9 @@ pip install "fastapi[standard]"
 # RUN
 ```
 fastapi dev main.py
+
+uvicorn main:app --reload
+
 ```
 
 # OAuth2
