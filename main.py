@@ -5,9 +5,15 @@ from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional
 from pydantic import BaseModel
+import asyncpg
+from typing import Optional
 
 # FastAPI অ্যাপ তৈরি
 app = FastAPI()
+
+# PostgreSQL কনফিগারেশন
+# DATABASE_URL = "postgresql://user:password@localhost:5432/authdb"
+DATABASE_URL = "postgresql://nazmul:123456@localhost:5432/authdb"
 
 # সিক্রেট কী এবং অ্যালগরিদম
 SECRET_KEY = "your-secret-key"  # প্রোডাকশনে এটি সিকিউর কী ব্যবহার করুন
@@ -29,30 +35,43 @@ class User(BaseModel):
 class UserInDB(User):
     hashed_password: str
 
-# ফেক ডাটাবেস (উদাহরণের জন্য)
-fake_users_db = {
-    "testuser": {
-        "username": "testuser",
-        "email": "testuser@example.com",
-        "hashed_password": pwd_context.hash("testpassword"),
-        "disabled": False,
-    }
-}
+# ডাটাবেস কানেকশন পুল তৈরি
+async def get_db():
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        yield conn
+    finally:
+        await conn.close()
+
+# ইউজার তৈরি করার ফাংশন
+async def create_user(conn, username: str, email: str, password: str):
+    hashed_password = pwd_context.hash(password)
+    query = """
+    INSERT INTO users (username, email, hashed_password, disabled)
+    VALUES ($1, $2, $3, $4)
+    RETURNING username, email, hashed_password, disabled
+    """
+    try:
+        user = await conn.fetchrow(query, username, email, hashed_password, False)
+        return UserInDB(**user)
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(status_code=400, detail="Username already exists")
 
 # পাসওয়ার্ড ভেরিফাই
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
 # ইউজার পাওয়া
-def get_user(db, username: str):
-    if username in db:
-        user_dict = db[username]
-        return UserInDB(**user_dict)
+async def get_user(conn, username: str):
+    query = "SELECT username, email, hashed_password, disabled FROM users WHERE username = $1"
+    user = await conn.fetchrow(query, username)
+    if user:
+        return UserInDB(**user)
     return None
 
 # ইউজার অথেনটিকেট
-def authenticate_user(fake_db, username: str, password: str):
-    user = get_user(fake_db, username)
+async def authenticate_user(conn, username: str, password: str):
+    user = await get_user(conn, username)
     if not user:
         return False
     if not verify_password(password, user.hashed_password):
@@ -71,7 +90,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     return encoded_jwt
 
 # বর্তমান ইউজার পাওয়া
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+async def get_current_user(token: str = Depends(oauth2_scheme), conn = Depends(get_db)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -84,15 +103,35 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
             raise credentials_exception
     except JWTError:
         raise credentials_exception
-    user = get_user(fake_users_db, username=username)
+    user = await get_user(conn, username=username)
     if user is None:
         raise credentials_exception
     return user
 
+# ডাটাবেস টেবিল তৈরি
+async def init_db():
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username VARCHAR(50) PRIMARY KEY,
+                email VARCHAR(100) NOT NULL,
+                hashed_password TEXT NOT NULL,
+                disabled BOOLEAN NOT NULL
+            )
+        """)
+    finally:
+        await conn.close()
+
+# অ্যাপ স্টার্টআপে ডাটাবেস ইনিশিয়ালাইজ
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
+
 # টোকেন জেনারেট করার এন্ডপয়েন্ট
 @app.post("/token")
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = authenticate_user(fake_users_db, form_data.username, form_data.password)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), conn = Depends(get_db)):
+    user = await authenticate_user(conn, form_data.username, form_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -104,6 +143,12 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
         data={"sub": user.username}, expires_delta=access_token_expires
     )
     return {"access_token": access_token, "token_type": "bearer"}
+
+# ইউজার তৈরির এন্ডপয়েন্ট
+@app.post("/users/")
+async def create_new_user(username: str, email: str, password: str, conn = Depends(get_db)):
+    user = await create_user(conn, username, email, password)
+    return user
 
 # সুরক্ষিত এন্ডপয়েন্ট
 @app.get("/users/me")
